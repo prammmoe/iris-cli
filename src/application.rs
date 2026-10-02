@@ -1,4 +1,4 @@
-use crate::domain::{RegisteredRepository, Todo, WorkLog};
+use crate::domain::{GitOutput, RegisteredRepository, RemoteOperation, Todo, WorkLog};
 use crate::ports::{GitReader, Store};
 use anyhow::{Result, bail};
 use std::path::PathBuf;
@@ -54,6 +54,18 @@ pub fn repositories(store: &impl Store) -> Result<Vec<RegisteredRepository>> {
 }
 pub fn remove_repo(store: &mut impl Store, name: &str) -> Result<()> {
     store.remove_repository(name)
+}
+pub fn run_remote(
+    store: &impl Store,
+    git: &impl GitReader,
+    target: Option<&str>,
+    operation: RemoteOperation,
+) -> Result<GitOutput> {
+    let repository = match target {
+        Some(name) => store.repository(name)?,
+        None => git.current_repository()?,
+    };
+    git.run_remote(&repository, &operation)
 }
 pub fn git_today(store: &impl Store, git: &impl GitReader) -> Result<GitToday> {
     let mut result = GitToday {

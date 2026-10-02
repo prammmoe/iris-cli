@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use iris::application::{self, Today};
+use iris::domain::RemoteOperation;
 use iris::infrastructure::{ProcessGit, SqliteStore};
 use std::path::PathBuf;
 
@@ -57,6 +58,8 @@ enum RepoCommand {
 
 #[derive(Args)]
 struct GitArgs {
+    #[arg(long)]
+    repo: Option<String>,
     #[command(subcommand)]
     command: GitCommand,
 }
@@ -66,6 +69,29 @@ enum GitCommand {
         #[arg(long)]
         all: bool,
     },
+    Remote(RemoteArgs),
+    Fetch {
+        remote: Option<String>,
+    },
+    Pull {
+        remote: Option<String>,
+        branch: Option<String>,
+    },
+    Push {
+        remote: Option<String>,
+        branch: Option<String>,
+    },
+}
+#[derive(Args)]
+struct RemoteArgs {
+    #[command(subcommand)]
+    command: RemoteCommand,
+}
+#[derive(Subcommand)]
+enum RemoteCommand {
+    Add { name: String, url: String },
+    List,
+    Remove { name: String },
 }
 
 fn main() {
@@ -125,9 +151,49 @@ fn run() -> Result<()> {
         Command::Git(args) => match args.command {
             GitCommand::Today { all: true } => render_git(application::git_today(&store, &git)?),
             GitCommand::Today { all: false } => anyhow::bail!("use `iris git today --all`"),
+            GitCommand::Remote(remote) => run_remote(
+                &store,
+                &git,
+                args.repo.as_deref(),
+                match remote.command {
+                    RemoteCommand::Add { name, url } => RemoteOperation::Add { name, url },
+                    RemoteCommand::List => RemoteOperation::List,
+                    RemoteCommand::Remove { name } => RemoteOperation::Remove { name },
+                },
+            )?,
+            GitCommand::Fetch { remote } => run_remote(
+                &store,
+                &git,
+                args.repo.as_deref(),
+                RemoteOperation::Fetch { remote },
+            )?,
+            GitCommand::Pull { remote, branch } => run_remote(
+                &store,
+                &git,
+                args.repo.as_deref(),
+                RemoteOperation::Pull { remote, branch },
+            )?,
+            GitCommand::Push { remote, branch } => run_remote(
+                &store,
+                &git,
+                args.repo.as_deref(),
+                RemoteOperation::Push { remote, branch },
+            )?,
         },
         Command::Today => render_today(application::today(&store, &git)?),
     }
+    Ok(())
+}
+
+fn run_remote(
+    store: &SqliteStore,
+    git: &ProcessGit,
+    target: Option<&str>,
+    operation: RemoteOperation,
+) -> Result<()> {
+    let output = application::run_remote(store, git, target, operation)?;
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
     Ok(())
 }
 

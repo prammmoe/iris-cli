@@ -194,3 +194,86 @@ fn database_starts_at_the_initial_schema_migration() {
         .unwrap();
     assert_eq!(version, 1);
 }
+
+#[test]
+fn remote_commands_work_for_current_and_registered_repositories() {
+    let data_dir = TempDir::new().unwrap();
+    let repository = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    git(&["init"], repository.path());
+    git(&["init", "--bare"], remote.path());
+    ProcessCommand::new("git")
+        .args(["config", "user.email", "iris@example.com"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    ProcessCommand::new("git")
+        .args(["config", "user.name", "Iris Test"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("README.md"), "remote test\n").unwrap();
+    git(&["add", "README.md"], repository.path());
+    git(&["commit", "-m", "remote test"], repository.path());
+
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            remote.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .args(["git", "remote", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("origin"));
+    iris(&data_dir)
+        .args(["repo", "add", repository.path().to_str().unwrap()])
+        .assert()
+        .success();
+    iris(&data_dir)
+        .args([
+            "git",
+            "--repo",
+            repository.path().file_name().unwrap().to_str().unwrap(),
+            "push",
+            "origin",
+            "HEAD",
+        ])
+        .assert()
+        .success();
+    iris(&data_dir)
+        .args([
+            "git",
+            "--repo",
+            repository.path().file_name().unwrap().to_str().unwrap(),
+            "fetch",
+            "origin",
+        ])
+        .assert()
+        .success();
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .args(["git", "remote", "remove", "origin"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn push_without_an_upstream_keeps_git_error_output() {
+    let data_dir = TempDir::new().unwrap();
+    let repository = TempDir::new().unwrap();
+    git(&["init"], repository.path());
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .args(["git", "push"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Git remote operation failed"));
+}

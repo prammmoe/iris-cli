@@ -17,3 +17,28 @@ pub struct GitCommit {
     pub timestamp: DateTime<Local>,
     pub message: String,
 }
+pub enum RemoteOperation {
+    Add {
+        name: String,
+        url: String,
+    },
+    List,
+    Remove {
+        name: String,
+    },
+    Fetch {
+        remote: Option<String>,
+    },
+    Pull {
+        remote: Option<String>,
+        branch: Option<String>,
+    },
+    Push {
+        remote: Option<String>,
+        branch: Option<String>,
+    },
+}
+pub struct GitOutput {
+    pub stdout: String,
+    pub stderr: String,
+}

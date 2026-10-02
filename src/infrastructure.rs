@@ -131,6 +131,20 @@ impl Store for SqliteStore {
             })?
             .collect::<rusqlite::Result<_>>()?)
     }
+    fn repository(&self, name: &str) -> Result<RegisteredRepository> {
+        self.0
+            .query_row(
+                "SELECT name, path FROM repositories WHERE name = ?1",
+                [name],
+                |row| {
+                    Ok(RegisteredRepository {
+                        name: row.get(0)?,
+                        path: PathBuf::from(row.get::<_, String>(1)?),
+                    })
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("registered repository '{name}' was not found"))
+    }
     fn remove_repository(&mut self, name: &str) -> Result<()> {
         if self
             .0
@@ -146,6 +160,9 @@ impl Store for SqliteStore {
 pub struct ProcessGit;
 
 impl GitReader for ProcessGit {
+    fn current_repository(&self) -> Result<RegisteredRepository> {
+        self.validate_repository(&std::env::current_dir()?)
+    }
     fn validate_repository(&self, path: &Path) -> Result<RegisteredRepository> {
         let path = path
             .canonicalize()
@@ -205,4 +222,45 @@ impl GitReader for ProcessGit {
         commits.sort_by_key(|commit| commit.timestamp);
         Ok(commits)
     }
+    fn run_remote(
+        &self,
+        repository: &RegisteredRepository,
+        operation: &crate::domain::RemoteOperation,
+    ) -> Result<crate::domain::GitOutput> {
+        let args = match operation {
+            crate::domain::RemoteOperation::Add { name, url } => {
+                vec!["remote".into(), "add".into(), name.clone(), url.clone()]
+            }
+            crate::domain::RemoteOperation::List => vec!["remote".into()],
+            crate::domain::RemoteOperation::Remove { name } => {
+                vec!["remote".into(), "remove".into(), name.clone()]
+            }
+            crate::domain::RemoteOperation::Fetch { remote } => {
+                with_optional(vec!["fetch".into()], remote)
+            }
+            crate::domain::RemoteOperation::Pull { remote, branch } => {
+                with_optional(with_optional(vec!["pull".into()], remote), branch)
+            }
+            crate::domain::RemoteOperation::Push { remote, branch } => {
+                with_optional(with_optional(vec!["push".into()], remote), branch)
+            }
+        };
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(&repository.path)
+            .output()?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        if !output.status.success() {
+            bail!("Git remote operation failed:\n{stderr}");
+        }
+        Ok(crate::domain::GitOutput { stdout, stderr })
+    }
+}
+
+fn with_optional(mut args: Vec<String>, value: &Option<String>) -> Vec<String> {
+    if let Some(value) = value {
+        args.push(value.clone());
+    }
+    args
 }
