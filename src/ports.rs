@@ -14,6 +14,7 @@ pub trait Store {
 }
 
 pub trait GitReader {
-    fn is_repository(&self, path: &Path) -> Result<bool>;
+    fn validate_repository(&self, path: &Path) -> Result<RegisteredRepository>;
+    fn repository_exists(&self, repository: &RegisteredRepository) -> bool;
     fn commits_today(&self, repository: &RegisteredRepository) -> Result<Vec<GitCommit>>;
 }

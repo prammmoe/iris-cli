@@ -1,7 +1,7 @@
 use crate::domain::{GitCommit, RegisteredRepository, Todo, WorkLog};
 use crate::ports::{GitReader, Store};
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Duration, Local, TimeZone};
+use chrono::{DateTime, Local};
 use directories::ProjectDirs;
 use rusqlite::{Connection, params};
 use std::fs;
@@ -21,11 +21,19 @@ impl SqliteStore {
             .context("could not determine Iris data directory")?;
         fs::create_dir_all(&directory)?;
         let connection = Connection::open(directory.join("iris.db"))?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, completed_at TEXT);
-             CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, content TEXT NOT NULL, created_at TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS repositories (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);",
-        )?;
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        match version {
+            0 => connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, completed_at TEXT);
+                 CREATE TABLE logs (id INTEGER PRIMARY KEY, content TEXT NOT NULL, created_at TEXT NOT NULL);
+                 CREATE TABLE repositories (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+                 PRAGMA user_version = 1;
+                 COMMIT;",
+            )?,
+            1 => {}
+            _ => bail!("database schema version {version} is newer than Iris supports"),
+        }
         Ok(Self(connection))
     }
 }
@@ -72,16 +80,10 @@ impl Store for SqliteStore {
         Ok(())
     }
     fn today_logs(&self) -> Result<Vec<WorkLog>> {
-        let start = Local
-            .from_local_datetime(&Local::now().date_naive().and_hms_opt(0, 0, 0).unwrap())
-            .single()
-            .unwrap()
-            .to_rfc3339();
-        let mut statement = self.0.prepare(
-            "SELECT content, created_at FROM logs WHERE created_at >= ?1 ORDER BY created_at",
-        )?;
-        Ok(statement
-            .query_map([start], |row| {
+        let today = Local::now().date_naive();
+        let mut statement = self.0.prepare("SELECT content, created_at FROM logs")?;
+        let mut logs = statement
+            .query_map([], |row| {
                 let timestamp: String = row.get(1)?;
                 let created_at = DateTime::parse_from_rfc3339(&timestamp)
                     .map_err(|error| {
@@ -97,7 +99,11 @@ impl Store for SqliteStore {
                     created_at,
                 })
             })?
-            .collect::<rusqlite::Result<_>>()?)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // ponytail: scans personal logs; add indexed UTC ranges if volume becomes material.
+        logs.retain(|log| log.created_at.date_naive() == today);
+        logs.sort_by_key(|log| log.created_at);
+        Ok(logs)
     }
     fn add_repository(&mut self, repository: &RegisteredRepository) -> Result<()> {
         self.0
@@ -140,35 +146,49 @@ impl Store for SqliteStore {
 pub struct ProcessGit;
 
 impl GitReader for ProcessGit {
-    fn is_repository(&self, path: &Path) -> Result<bool> {
-        Ok(Command::new("git")
-            .args(["rev-parse", "--is-inside-work-tree"])
-            .current_dir(path)
-            .output()?
-            .status
-            .success())
+    fn validate_repository(&self, path: &Path) -> Result<RegisteredRepository> {
+        let path = path
+            .canonicalize()
+            .map_err(|_| anyhow::anyhow!("repository path does not exist"))?;
+        if !path.is_dir()
+            || !Command::new("git")
+                .args(["rev-parse", "--is-inside-work-tree"])
+                .current_dir(&path)
+                .output()?
+                .status
+                .success()
+        {
+            bail!("path is not a Git repository");
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("repository path has no name")?
+            .to_owned();
+        Ok(RegisteredRepository { name, path })
+    }
+    fn repository_exists(&self, repository: &RegisteredRepository) -> bool {
+        repository.path.exists()
     }
     fn commits_today(&self, repository: &RegisteredRepository) -> Result<Vec<GitCommit>> {
-        let start = Local
-            .from_local_datetime(&Local::now().date_naive().and_hms_opt(0, 0, 0).unwrap())
-            .single()
-            .unwrap();
-        let end = start + Duration::days(1);
         let output = Command::new("git")
-            .args([
-                "log",
-                "--format=%cI%x1f%s",
-                "--since",
-                &start.to_rfc3339(),
-                "--until",
-                &end.to_rfc3339(),
-            ])
+            .args(["log", "--format=%cI%x1f%s"])
             .current_dir(&repository.path)
             .output()?;
         if !output.status.success() {
+            if Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&repository.path)
+                .output()?
+                .status
+                .success()
+            {
+                return Ok(Vec::new());
+            }
             bail!("git log failed");
         }
-        String::from_utf8(output.stdout)?
+        let today = Local::now().date_naive();
+        let mut commits = String::from_utf8(output.stdout)?
             .lines()
             .map(|line| {
                 let (timestamp, message) = line
@@ -179,6 +199,10 @@ impl GitReader for ProcessGit {
                     message: message.to_owned(),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        // ponytail: scans each repository history; restore Git date bounds if profiling needs it.
+        commits.retain(|commit| commit.timestamp.date_naive() == today);
+        commits.sort_by_key(|commit| commit.timestamp);
+        Ok(commits)
     }
 }

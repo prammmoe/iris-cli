@@ -45,18 +45,7 @@ pub fn register_repo(
     git: &impl GitReader,
     path: PathBuf,
 ) -> Result<RegisteredRepository> {
-    let path = path
-        .canonicalize()
-        .map_err(|_| anyhow::anyhow!("repository path does not exist"))?;
-    if !path.is_dir() || !git.is_repository(&path)? {
-        bail!("path is not a Git repository");
-    }
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("repository path has no name"))?
-        .to_owned();
-    let repository = RegisteredRepository { name, path };
+    let repository = git.validate_repository(&path)?;
     store.add_repository(&repository)?;
     Ok(repository)
 }
@@ -72,7 +61,7 @@ pub fn git_today(store: &impl Store, git: &impl GitReader) -> Result<GitToday> {
         warnings: Vec::new(),
     };
     for repository in store.repositories()? {
-        if !repository.path.exists() {
+        if !git.repository_exists(&repository) {
             result
                 .warnings
                 .push(format!("repository '{}' no longer exists", repository.name));
