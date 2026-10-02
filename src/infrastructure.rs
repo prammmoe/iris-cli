@@ -5,8 +5,9 @@ use chrono::{DateTime, Local};
 use directories::ProjectDirs;
 use rusqlite::{Connection, params};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub struct SqliteStore(Connection);
 
@@ -158,6 +159,37 @@ impl Store for SqliteStore {
 }
 
 pub struct ProcessGit;
+pub struct OllamaComposer;
+
+impl crate::ports::CommitComposer for OllamaComposer {
+    fn compose(&self, diff: &str) -> Result<String> {
+        let prompt = format!(
+            "Write only a Git commit message for this staged diff. First line: Conventional Commit subject. Then blank line, Changed with bullet points, Why with bullet points. Add Bugs And Fixes with Bug: and Fix: bullets only when this is a bug fix. No Markdown fence.\n\n{diff}"
+        );
+        let mut child = Command::new("ollama")
+            .args(["run", "gemma3:1b"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("could not start Ollama; ensure it is running and gemma3:1b is installed")?;
+        child
+            .stdin
+            .as_mut()
+            .context("could not open Ollama input")?
+            .write_all(prompt.as_bytes())?;
+        let output = child.wait_with_output()?;
+        let stderr = String::from_utf8(output.stderr)?;
+        if !output.status.success() {
+            bail!("Ollama compose failed:\n{stderr}");
+        }
+        let message = String::from_utf8(output.stdout)?.trim().to_owned();
+        if message.is_empty() {
+            bail!("Ollama returned an empty commit message");
+        }
+        Ok(message)
+    }
+}
 
 impl GitReader for ProcessGit {
     fn current_repository(&self) -> Result<RegisteredRepository> {
@@ -253,6 +285,32 @@ impl GitReader for ProcessGit {
         let stderr = String::from_utf8(output.stderr)?;
         if !output.status.success() {
             bail!("Git remote operation failed:\n{stderr}");
+        }
+        Ok(crate::domain::GitOutput { stdout, stderr })
+    }
+    fn staged_diff(&self, repository: &RegisteredRepository) -> Result<String> {
+        let output = Command::new("git")
+            .args(["diff", "--staged", "--no-ext-diff"])
+            .current_dir(&repository.path)
+            .output()?;
+        if !output.status.success() {
+            bail!("could not read staged changes");
+        }
+        Ok(String::from_utf8(output.stdout)?)
+    }
+    fn commit(
+        &self,
+        repository: &RegisteredRepository,
+        message: &str,
+    ) -> Result<crate::domain::GitOutput> {
+        let output = Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(&repository.path)
+            .output()?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        if !output.status.success() {
+            bail!("Git commit failed:\n{stderr}");
         }
         Ok(crate::domain::GitOutput { stdout, stderr })
     }

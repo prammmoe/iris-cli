@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use iris::application::{self, Today};
 use iris::domain::RemoteOperation;
-use iris::infrastructure::{ProcessGit, SqliteStore};
+use iris::infrastructure::{OllamaComposer, ProcessGit, SqliteStore};
+use iris::ports::GitReader;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -18,7 +20,19 @@ enum Command {
     Log(LogArgs),
     Repo(RepoArgs),
     Git(GitArgs),
+    Compose(ComposeArgs),
     Today,
+}
+#[derive(Args)]
+struct ComposeArgs {
+    #[arg(long)]
+    repo: Option<String>,
+    #[command(subcommand)]
+    command: ComposeCommand,
+}
+#[derive(Subcommand)]
+enum ComposeCommand {
+    Commit,
 }
 
 #[derive(Args)]
@@ -180,8 +194,32 @@ fn run() -> Result<()> {
                 RemoteOperation::Push { remote, branch },
             )?,
         },
+        Command::Compose(args) => match args.command {
+            ComposeCommand::Commit => compose_commit(&store, &git, args.repo.as_deref())?,
+        },
         Command::Today => render_today(application::today(&store, &git)?),
     }
+    Ok(())
+}
+
+fn compose_commit(store: &SqliteStore, git: &ProcessGit, target: Option<&str>) -> Result<()> {
+    let (repository, diff, message) =
+        application::compose_commit(store, git, &OllamaComposer, target)?;
+    println!("\n{message}\n");
+    print!("Create this commit? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+        println!("Commit cancelled.");
+        return Ok(());
+    }
+    if git.staged_diff(&repository)? != diff {
+        anyhow::bail!("staged changes changed; compose again");
+    }
+    let output = git.commit(&repository, &message)?;
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
     Ok(())
 }
 

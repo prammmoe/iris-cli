@@ -24,4 +24,10 @@ pub trait GitReader {
         repository: &RegisteredRepository,
         operation: &RemoteOperation,
     ) -> Result<GitOutput>;
+    fn staged_diff(&self, repository: &RegisteredRepository) -> Result<String>;
+    fn commit(&self, repository: &RegisteredRepository, message: &str) -> Result<GitOutput>;
+}
+
+pub trait CommitComposer {
+    fn compose(&self, diff: &str) -> Result<String>;
 }

@@ -1,5 +1,5 @@
 use crate::domain::{GitOutput, RegisteredRepository, RemoteOperation, Todo, WorkLog};
-use crate::ports::{GitReader, Store};
+use crate::ports::{CommitComposer, GitReader, Store};
 use anyhow::{Result, bail};
 use std::path::PathBuf;
 
@@ -66,6 +66,23 @@ pub fn run_remote(
         None => git.current_repository()?,
     };
     git.run_remote(&repository, &operation)
+}
+pub fn compose_commit(
+    store: &impl Store,
+    git: &impl GitReader,
+    composer: &impl CommitComposer,
+    target: Option<&str>,
+) -> Result<(RegisteredRepository, String, String)> {
+    let repository = match target {
+        Some(name) => store.repository(name)?,
+        None => git.current_repository()?,
+    };
+    let diff = git.staged_diff(&repository)?;
+    if diff.trim().is_empty() {
+        bail!("there are no staged changes");
+    }
+    let message = composer.compose(&diff)?;
+    Ok((repository, diff, message))
 }
 pub fn git_today(store: &impl Store, git: &impl GitReader) -> Result<GitToday> {
     let mut result = GitToday {
