@@ -38,6 +38,18 @@ pub enum RemoteOperation {
         branch: Option<String>,
     },
 }
+pub enum GitOperation {
+    AddAll,
+    Add { paths: Vec<String> },
+    Push,
+    Branch { all: bool },
+    Stash,
+    Log,
+    Status,
+    StatusPorcelain,
+    Remote,
+    AddOrigin { url: String },
+}
 pub struct GitOutput {
     pub stdout: String,
     pub stderr: String,

@@ -1,13 +1,15 @@
-use crate::domain::{GitCommit, RegisteredRepository, Todo, WorkLog};
+use crate::domain::{GitCommit, GitOperation, GitOutput, RegisteredRepository, Todo, WorkLog};
 use crate::ports::{GitReader, Store};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
 use directories::ProjectDirs;
 use rusqlite::{Connection, params};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 pub struct SqliteStore(Connection);
 
@@ -163,31 +165,190 @@ pub struct OllamaComposer;
 
 impl crate::ports::CommitComposer for OllamaComposer {
     fn compose(&self, diff: &str) -> Result<String> {
-        let prompt = format!(
-            "Write only a Git commit message for this staged diff. First line: Conventional Commit subject. Then blank line, Changed with bullet points, Why with bullet points. Add Bugs And Fixes with Bug: and Fix: bullets only when this is a bug fix. No Markdown fence.\n\n{diff}"
+        let prompt = crate::application::build_commit_prompt(diff);
+        let message = run_ollama(&prompt)?;
+        if crate::application::validate_commit_message(&message).is_ok() {
+            return Ok(message);
+        }
+        let retry = run_ollama(&format!(
+            "{prompt}\n\nYour prior response did not match the required structure. Output only a valid commit message now."
+        ))?;
+        if crate::application::validate_commit_message(&retry).is_err() {
+            bail!("Ollama returned an invalid commit message:\n{retry}");
+        }
+        Ok(retry)
+    }
+}
+
+fn run_ollama(prompt: &str) -> Result<String> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "type": { "type": "string", "enum": ["feat", "fix", "docs", "refactor", "perf", "test", "build", "ci", "chore"] },
+            "subject": { "type": "string", "description": "actual lowercase English commit subject based on the diff" },
+            "changed": { "type": "array", "items": { "type": "string" }, "description": "actual changes visible in the diff" },
+            "why": { "type": "array", "items": { "type": "string" }, "description": "reasons supported by the diff" },
+            "bug": { "type": "string", "description": "actual bug for fix commits, otherwise empty" },
+            "fix": { "type": "string", "description": "actual fix for fix commits, otherwise empty" }
+        },
+        "required": ["type", "subject", "changed", "why", "bug", "fix"],
+        "additionalProperties": false
+    });
+    let payload = serde_json::json!({
+        "model": "qwen3:1.7b",
+        "system": "Return only the requested JSON object. Never explain the input.",
+        "prompt": prompt,
+        "format": schema,
+        "stream": false,
+        "options": { "num_ctx": 16384, "temperature": 0 }
+    })
+    .to_string();
+    let mut stream = TcpStream::connect("127.0.0.1:11434")
+        .context("could not connect to Ollama; ensure it is running")?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    let request = format!(
+        "POST /api/generate HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("Ollama returned an invalid HTTP response")?;
+    if !headers.starts_with("HTTP/1.1 200") {
+        bail!("Ollama compose failed:\n{body}");
+    }
+    let body = if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        decode_chunked(body)?
+    } else {
+        body.to_owned()
+    };
+    let body: serde_json::Value =
+        serde_json::from_str(&body).context("Ollama returned invalid JSON")?;
+    let generated = body["response"]
+        .as_str()
+        .context("Ollama response did not contain generated text")?;
+    let message = structured_or_plain_message(generated)?;
+    if message.is_empty() {
+        bail!("Ollama returned an empty commit message");
+    }
+    Ok(message)
+}
+
+fn structured_or_plain_message(generated: &str) -> Result<String> {
+    let generated = generated
+        .trim()
+        .strip_prefix("```json")
+        .or_else(|| generated.trim().strip_prefix("```"))
+        .unwrap_or(generated.trim())
+        .strip_suffix("```")
+        .unwrap_or(generated.trim())
+        .trim();
+    match serde_json::from_str::<serde_json::Value>(generated) {
+        Ok(parts) => format_commit_message(&parts),
+        Err(_) => Ok(generated.to_owned()),
+    }
+}
+
+fn format_commit_message(parts: &serde_json::Value) -> Result<String> {
+    let kind = parts["type"]
+        .as_str()
+        .context("Ollama response did not contain a commit type")?;
+    let subject = parts["subject"]
+        .as_str()
+        .context("Ollama response did not contain a commit subject")?;
+    let changed = message_bullets(&parts["changed"], "changed")?;
+    let why = message_bullets(&parts["why"], "why")?;
+    let mut message = format!("{kind}: {subject}\n\nChanged\n{changed}\nWhy\n{why}");
+    if kind == "fix" {
+        let bug = parts["bug"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .context("Ollama response did not contain a bug description")?;
+        let fix = parts["fix"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .context("Ollama response did not contain a fix description")?;
+        message.push_str(&format!("\nBugs And Fixes\n- Bug: {bug}\n- Fix: {fix}"));
+    }
+    Ok(message)
+}
+
+fn message_bullets(value: &serde_json::Value, name: &str) -> Result<String> {
+    let bullets = value
+        .as_array()
+        .context(format!("Ollama response did not contain {name} bullets"))?;
+    if bullets.is_empty() {
+        bail!("Ollama response did not contain {name} bullets");
+    }
+    bullets
+        .iter()
+        .map(|bullet| {
+            let bullet = bullet
+                .as_str()
+                .filter(|bullet| !bullet.trim().is_empty() && !bullet.contains('\n'))
+                .context("Ollama returned an invalid bullet")?;
+            Ok(format!("- {bullet}"))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|bullets| bullets.join("\n"))
+}
+
+fn decode_chunked(body: &str) -> Result<String> {
+    let mut body = body;
+    let mut decoded = String::new();
+    loop {
+        let (size, rest) = body
+            .split_once("\r\n")
+            .context("Ollama returned malformed chunked data")?;
+        let size = usize::from_str_radix(size.split(';').next().unwrap_or_default(), 16)
+            .context("Ollama returned an invalid chunk size")?;
+        if size == 0 {
+            return Ok(decoded);
+        }
+        if rest.len() < size + 2 || !rest[size..].starts_with("\r\n") {
+            bail!("Ollama returned a truncated chunk");
+        }
+        decoded.push_str(&rest[..size]);
+        body = &rest[size + 2..];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_chunked, format_commit_message, structured_or_plain_message};
+
+    #[test]
+    fn decodes_a_chunked_ollama_response() {
+        assert_eq!(
+            decode_chunked("6\r\n{\"ok\":\r\n5\r\ntrue}\r\n0\r\n\r\n").unwrap(),
+            "{\"ok\":true}"
         );
-        let mut child = Command::new("ollama")
-            .args(["run", "gemma3:1b"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("could not start Ollama; ensure it is running and gemma3:1b is installed")?;
-        child
-            .stdin
-            .as_mut()
-            .context("could not open Ollama input")?
-            .write_all(prompt.as_bytes())?;
-        let output = child.wait_with_output()?;
-        let stderr = String::from_utf8(output.stderr)?;
-        if !output.status.success() {
-            bail!("Ollama compose failed:\n{stderr}");
-        }
-        let message = String::from_utf8(output.stdout)?.trim().to_owned();
-        if message.is_empty() {
-            bail!("Ollama returned an empty commit message");
-        }
-        Ok(message)
+    }
+
+    #[test]
+    fn formats_structured_model_output_as_a_valid_commit_message() {
+        let parts = serde_json::json!({
+            "type": "feat",
+            "subject": "add git shortcuts",
+            "changed": ["add current-directory git commands"],
+            "why": ["make common actions concise"],
+            "bug": "",
+            "fix": ""
+        });
+        let message = format_commit_message(&parts).unwrap();
+        assert!(crate::application::validate_commit_message(&message).is_ok());
+    }
+
+    #[test]
+    fn accepts_plain_text_when_ollama_ignores_the_schema() {
+        let message =
+            "feat: add shortcuts\n\nChanged\n- add git aliases\nWhy\n- make common actions concise";
+        assert_eq!(structured_or_plain_message(message).unwrap(), message);
     }
 }
 
@@ -287,6 +448,43 @@ impl GitReader for ProcessGit {
             bail!("Git remote operation failed:\n{stderr}");
         }
         Ok(crate::domain::GitOutput { stdout, stderr })
+    }
+    fn run_git(
+        &self,
+        repository: &RegisteredRepository,
+        operation: GitOperation,
+    ) -> Result<GitOutput> {
+        let args: Vec<String> = match operation {
+            GitOperation::AddAll => vec!["add".into(), ".".into()],
+            GitOperation::Add { paths } => {
+                let mut args = vec!["add".into(), "--".into()];
+                args.extend(paths);
+                args
+            }
+            GitOperation::Push => vec!["push".into()],
+            GitOperation::Branch { all: false } => vec!["branch".into()],
+            GitOperation::Branch { all: true } => vec!["branch".into(), "--all".into()],
+            GitOperation::Stash => vec!["stash".into()],
+            GitOperation::Log => vec!["log".into()],
+            GitOperation::Status => vec!["status".into()],
+            GitOperation::StatusPorcelain => {
+                vec!["status".into(), "--porcelain=v1".into(), "-z".into()]
+            }
+            GitOperation::Remote => vec!["remote".into()],
+            GitOperation::AddOrigin { url } => {
+                vec!["remote".into(), "add".into(), "origin".into(), url]
+            }
+        };
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(&repository.path)
+            .output()?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        if !output.status.success() {
+            bail!("Git operation failed:\n{stderr}");
+        }
+        Ok(GitOutput { stdout, stderr })
     }
     fn staged_diff(&self, repository: &RegisteredRepository) -> Result<String> {
         let output = Command::new("git")

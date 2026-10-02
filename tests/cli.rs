@@ -1,3 +1,5 @@
+// This is a test file for the Iris CLI application. It uses the `assert_cmd` crate to run the CLI commands and check their output. The tests cover various functionalities of the Iris application, including adding and completing todos, logging activities, combining local data with git activity, handling missing repositories, and ensuring that the database starts at the initial schema migration.
+
 use assert_cmd::Command;
 use chrono::{Duration, Local, TimeZone, Utc};
 use predicates::prelude::*;
@@ -276,4 +278,172 @@ fn push_without_an_upstream_keeps_git_error_output() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Git remote operation failed"));
+}
+
+#[test]
+fn git_shortcuts_use_the_current_repository() {
+    let data_dir = TempDir::new().unwrap();
+    let repository = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    git(&["init"], repository.path());
+    git(&["init", "--bare"], remote.path());
+    ProcessCommand::new("git")
+        .args(["config", "user.email", "iris@example.com"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    ProcessCommand::new("git")
+        .args(["config", "user.name", "Iris Test"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("hello world.txt"), "hello\n").unwrap();
+
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .args(["forge", "all"])
+        .assert()
+        .success();
+    assert!(
+        !ProcessCommand::new("git")
+            .args(["diff", "--staged", "--quiet", "--", "hello world.txt"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .arg("inspect")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello world.txt"));
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .arg("realm")
+        .assert()
+        .success();
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .args(["realm", "all"])
+        .assert()
+        .success();
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .args(["outpost", "from", remote.path().to_str().unwrap()])
+        .assert()
+        .success();
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .arg("outpost")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("origin"));
+    git(&["commit", "-m", "initial"], repository.path());
+    git(&["push", "-u", "origin", "HEAD"], repository.path());
+    fs::write(repository.path().join("second.txt"), "second\n").unwrap();
+    git(&["add", "second.txt"], repository.path());
+    git(&["commit", "-m", "second"], repository.path());
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .arg("dispatch")
+        .assert()
+        .success();
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .arg("vault")
+        .assert()
+        .success();
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .arg("chronicle")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("second"));
+}
+
+#[test]
+fn forge_accepts_unique_number_and_path_selectors() {
+    let data_dir = TempDir::new().unwrap();
+    let repository = TempDir::new().unwrap();
+    git(&["init"], repository.path());
+    fs::write(repository.path().join("first file.txt"), "first\n").unwrap();
+    fs::write(repository.path().join("second.txt"), "second\n").unwrap();
+
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .arg("forge")
+        .write_stdin("1,second.txt,1\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1  first file.txt"))
+        .stdout(predicate::str::contains("2  second.txt"));
+    for path in ["first file.txt", "second.txt"] {
+        assert!(
+            !ProcessCommand::new("git")
+                .args(["diff", "--staged", "--quiet", "--", path])
+                .current_dir(repository.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+#[test]
+fn forge_cancels_for_empty_or_invalid_selection() {
+    let data_dir = TempDir::new().unwrap();
+    let repository = TempDir::new().unwrap();
+    git(&["init"], repository.path());
+    fs::write(repository.path().join("new.txt"), "new\n").unwrap();
+
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .arg("forge")
+        .write_stdin("99\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Forge cancelled"));
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .arg("forge")
+        .write_stdin("\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Forge cancelled"));
+    assert!(
+        ProcessCommand::new("git")
+            .args(["diff", "--staged", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn forge_cancels_when_there_are_no_changes() {
+    let data_dir = TempDir::new().unwrap();
+    let repository = TempDir::new().unwrap();
+    git(&["init"], repository.path());
+
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .arg("forge")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Forge cancelled: no changes"));
+}
+
+#[test]
+fn shortcuts_report_when_current_directory_is_not_a_repository() {
+    let data_dir = TempDir::new().unwrap();
+    let directory = TempDir::new().unwrap();
+    iris(&data_dir)
+        .current_dir(directory.path())
+        .arg("inspect")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a Git repository"));
 }

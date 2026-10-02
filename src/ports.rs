@@ -1,4 +1,6 @@
-use crate::domain::{GitCommit, GitOutput, RegisteredRepository, RemoteOperation, Todo, WorkLog};
+use crate::domain::{
+    GitCommit, GitOperation, GitOutput, RegisteredRepository, RemoteOperation, Todo, WorkLog,
+};
 use anyhow::Result;
 use std::path::Path;
 
@@ -23,6 +25,11 @@ pub trait GitReader {
         &self,
         repository: &RegisteredRepository,
         operation: &RemoteOperation,
+    ) -> Result<GitOutput>;
+    fn run_git(
+        &self,
+        repository: &RegisteredRepository,
+        operation: GitOperation,
     ) -> Result<GitOutput>;
     fn staged_diff(&self, repository: &RegisteredRepository) -> Result<String>;
     fn commit(&self, repository: &RegisteredRepository, message: &str) -> Result<GitOutput>;

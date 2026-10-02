@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use iris::application::{self, Today};
-use iris::domain::RemoteOperation;
+use iris::domain::{GitOperation, RemoteOperation};
 use iris::infrastructure::{OllamaComposer, ProcessGit, SqliteStore};
 use iris::ports::GitReader;
 use std::io::{self, Write};
@@ -21,7 +21,41 @@ enum Command {
     Repo(RepoArgs),
     Git(GitArgs),
     Compose(ComposeArgs),
+    Forge(ForgeArgs),
+    Dispatch,
+    Realm(RealmArgs),
+    Vault,
+    Chronicle,
+    Inspect,
+    Outpost(OutpostArgs),
     Today,
+}
+#[derive(Args)]
+struct ForgeArgs {
+    #[command(subcommand)]
+    command: Option<ForgeCommand>,
+}
+#[derive(Args)]
+struct RealmArgs {
+    #[command(subcommand)]
+    command: Option<RealmCommand>,
+}
+#[derive(Subcommand)]
+enum RealmCommand {
+    All,
+}
+#[derive(Subcommand)]
+enum ForgeCommand {
+    All,
+}
+#[derive(Args)]
+struct OutpostArgs {
+    #[command(subcommand)]
+    command: Option<OutpostCommand>,
+}
+#[derive(Subcommand)]
+enum OutpostCommand {
+    From { url: String },
 }
 #[derive(Args)]
 struct ComposeArgs {
@@ -197,8 +231,60 @@ fn run() -> Result<()> {
         Command::Compose(args) => match args.command {
             ComposeCommand::Commit => compose_commit(&store, &git, args.repo.as_deref())?,
         },
+        Command::Forge(args) => match args.command {
+            Some(ForgeCommand::All) => run_git(&git, GitOperation::AddAll)?,
+            None => forge(&git)?,
+        },
+        Command::Dispatch => run_git(&git, GitOperation::Push)?,
+        Command::Realm(args) => run_git(
+            &git,
+            GitOperation::Branch {
+                all: matches!(args.command, Some(RealmCommand::All)),
+            },
+        )?,
+        Command::Vault => run_git(&git, GitOperation::Stash)?,
+        Command::Chronicle => run_git(&git, GitOperation::Log)?,
+        Command::Inspect => run_git(&git, GitOperation::Status)?,
+        Command::Outpost(args) => run_git(
+            &git,
+            match args.command {
+                Some(OutpostCommand::From { url }) => GitOperation::AddOrigin { url },
+                None => GitOperation::Remote,
+            },
+        )?,
         Command::Today => render_today(application::today(&store, &git)?),
     }
+    Ok(())
+}
+
+fn forge(git: &ProcessGit) -> Result<()> {
+    let files = application::changed_files(git)?;
+    if files.is_empty() {
+        println!("Forge cancelled: no changes.");
+        return Ok(());
+    }
+    for (index, path) in files.iter().enumerate() {
+        println!("{}  {path}", index + 1);
+    }
+    print!("Select files to add (for example 1,3,src/main.rs): ");
+    io::stdout().flush()?;
+    let mut selectors = String::new();
+    io::stdin().read_line(&mut selectors)?;
+    let Ok(paths) = application::select_changed_files(&files, selectors.trim()) else {
+        println!("Forge cancelled.");
+        return Ok(());
+    };
+    if paths.is_empty() {
+        println!("Forge cancelled.");
+        return Ok(());
+    }
+    run_git(git, GitOperation::Add { paths })
+}
+
+fn run_git(git: &ProcessGit, operation: GitOperation) -> Result<()> {
+    let output = application::run_git(git, operation)?;
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
     Ok(())
 }
 
