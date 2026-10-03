@@ -202,6 +202,8 @@ iris shell setup --skip-iterm
 
 `--dry-run` prints the same ordered plan but does not run mutation commands or write files. `--no-default-shell` prevents `chsh`, and `--skip-iterm` prevents both iTerm2 installation and Dynamic Profile creation.
 
+If Fisher and Tide are already present in Fish's configuration directory, Iris does not reinstall or overwrite them. Instead, every normal `iris shell setup` run opens Tide's interactive `tide configure` wizard so you can select the theme and prompt layout. Dry-run only reports that the wizard would open. If Iris finds a partial Fisher or Tide installation, it stops with a repair message and leaves the existing files untouched.
+
 Homebrew must already be installed; Iris does not install it automatically. When Fish must be registered in `/etc/shells`, Iris announces the privileged action and invokes `sudo` only for that action. It never accepts, stores, or logs an administrator password.
 
 Iris leaves `~/.config/fish/config.fish` untouched. Its deterministic configuration is limited to:

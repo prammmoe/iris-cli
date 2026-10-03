@@ -35,7 +35,9 @@ pub struct InstalledShellState {
     pub fish_registered: bool,
     pub fish_is_default: bool,
     pub fisher_installed: bool,
+    pub fisher_incomplete: bool,
     pub tide_installed: bool,
+    pub tide_incomplete: bool,
     pub fish_config_current: bool,
     pub iterm_profile_current: bool,
 }
@@ -68,6 +70,9 @@ pub enum SetupAction {
         fish_path: PathBuf,
         plugin: &'static str,
     },
+    ConfigureTide {
+        fish_path: PathBuf,
+    },
     WriteManagedFishConfig {
         path: PathBuf,
         content: String,
@@ -91,6 +96,7 @@ pub enum ExecutionMode {
 
 pub trait ProcessRunner {
     fn run(&self, program: &Path, args: &[&str], input: Option<&str>) -> Result<ProcessOutput>;
+    fn run_interactive(&self, program: &Path, args: &[&str]) -> Result<ProcessOutput>;
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +136,25 @@ impl ProcessRunner for SystemRunner {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn run_interactive(&self, program: &Path, args: &[&str]) -> Result<ProcessOutput> {
+        use std::io::IsTerminal;
+
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            bail!(
+                "Tide configuration needs an interactive terminal. Run `iris shell setup` directly in a terminal."
+            )
+        }
+        let status = Command::new(program)
+            .args(args)
+            .status()
+            .with_context(|| format!("could not start {}", program.display()))?;
+        Ok(ProcessOutput {
+            success: status.success(),
+            stdout: String::new(),
+            stderr: String::new(),
         })
     }
 }
@@ -238,6 +263,16 @@ pub fn build_setup_plan(
         "could not resolve the Fish path; install Fish with Homebrew and run setup again",
     )?;
     let mut actions = Vec::new();
+    if state.fisher_incomplete {
+        bail!(
+            "Fisher files are incomplete. Repair the existing Fisher installation before running Iris setup; Iris will not overwrite Fish configuration files."
+        )
+    }
+    if state.tide_incomplete {
+        bail!(
+            "Tide files are incomplete. Repair the existing Tide installation before running Iris setup; Iris will not overwrite Fish configuration files."
+        )
+    }
     if !state.fish_installed {
         actions.push(SetupAction::InstallFormula { name: FISH_FORMULA });
     }
@@ -266,6 +301,11 @@ pub fn build_setup_plan(
         actions.push(SetupAction::InstallFishPlugin {
             fish_path: fish_path.clone(),
             plugin: TIDE_PLUGIN,
+        });
+    }
+    if state.fisher_installed && state.tide_installed {
+        actions.push(SetupAction::ConfigureTide {
+            fish_path: fish_path.clone(),
         });
     }
     let fish_config = managed_fish_config();
@@ -352,10 +392,21 @@ impl<R: ProcessRunner> SetupExecutor<'_, R> {
             SetupAction::InstallFishPlugin { fish_path, plugin } => self
                 .run(
                     fish_path,
-                    &["--no-config", "-c", &format!("fisher install {plugin}")],
+                    &["-c", &format!("fisher install {plugin}")],
                     None,
                 )
                 .map(|_| ()),
+            SetupAction::ConfigureTide { fish_path } => self
+                .runner
+                .run_interactive(fish_path, &["-c", "tide configure"])
+                .and_then(|output| {
+                    if output.success {
+                        Ok(())
+                    } else {
+                        bail!("Tide configuration wizard failed: {}", output.stderr.trim())
+                    }
+                })
+                .context("Could not configure Tide. Your existing Tide files were left unchanged."),
             SetupAction::WriteManagedFishConfig { path, content }
             | SetupAction::WriteItermDynamicProfile { path, content } => {
                 atomic_write(path, content)
@@ -418,8 +469,8 @@ fn inspect_state(
     let fish_registered = fish_path.is_some_and(|path| shell_is_registered(path).unwrap_or(false));
     let fish_is_default =
         fish_path.is_some_and(|path| environment.current_shell.as_deref() == Some(path));
-    let fisher_installed = fish_path.is_some_and(|path| fish_has(runner, path, "fisher"));
-    let tide_installed = fish_path.is_some_and(|path| fish_has(runner, path, "tide"));
+    let (fisher_installed, fisher_incomplete) = fisher_state(&environment.home_dir);
+    let (tide_installed, tide_incomplete) = tide_state(&environment.home_dir);
     let fish_config_current =
         fs::read_to_string(environment.home_dir.join(".config/fish/conf.d/iris.fish"))
             .map(|content| content == managed_fish_config())
@@ -434,7 +485,9 @@ fn inspect_state(
         fish_registered,
         fish_is_default,
         fisher_installed,
+        fisher_incomplete,
         tide_installed,
+        tide_incomplete,
         fish_config_current,
         iterm_profile_current,
     })
@@ -519,6 +572,7 @@ fn describe_action(action: &SetupAction) -> String {
         }
         SetupAction::InstallFisher { .. } => "→ Install Fisher".into(),
         SetupAction::InstallFishPlugin { plugin, .. } => format!("→ Install {plugin}"),
+        SetupAction::ConfigureTide { .. } => "→ Open the Tide configuration wizard".into(),
         SetupAction::WriteManagedFishConfig { path, .. } => format!("→ Write {}", path.display()),
         SetupAction::WriteItermDynamicProfile { path, .. } => format!("→ Write {}", path.display()),
     }
@@ -565,14 +619,23 @@ fn brew_installed(runner: &impl ProcessRunner, brew: &Path, kind: &str, name: &s
         .is_ok_and(|output| output.success)
 }
 
-fn fish_has(runner: &impl ProcessRunner, fish: &Path, command: &str) -> bool {
-    runner
-        .run(
-            fish,
-            &["--no-config", "-c", &format!("type -q {command}")],
-            None,
-        )
-        .is_ok_and(|output| output.success)
+fn fisher_state(home: &Path) -> (bool, bool) {
+    let config = home.join(".config/fish");
+    let function = config.join("functions/fisher.fish");
+    let completion = config.join("completions/fisher.fish");
+    let present = function.exists() || completion.exists();
+    (present, present && !function.exists())
+}
+
+fn tide_state(home: &Path) -> (bool, bool) {
+    let config = home.join(".config/fish");
+    let files = [
+        config.join("functions/tide.fish"),
+        config.join("functions/fish_prompt.fish"),
+        config.join("conf.d/_tide_init.fish"),
+    ];
+    let present = files.iter().any(|path| path.exists());
+    (present, present && !files.iter().all(|path| path.exists()))
 }
 
 fn shell_is_registered(path: &Path) -> Result<bool> {
@@ -622,6 +685,18 @@ mod tests {
             Ok(ProcessOutput {
                 success: true,
                 stdout: "/opt/custom".into(),
+                stderr: String::new(),
+            })
+        }
+
+        fn run_interactive(&self, program: &Path, args: &[&str]) -> Result<ProcessOutput> {
+            self.calls.borrow_mut().push((
+                program.to_path_buf(),
+                args.iter().map(|arg| (*arg).into()).collect(),
+            ));
+            Ok(ProcessOutput {
+                success: true,
+                stdout: String::new(),
                 stderr: String::new(),
             })
         }
@@ -680,6 +755,199 @@ mod tests {
             plan.actions.first(),
             Some(SetupAction::InstallFormula { name: FISH_FORMULA })
         ));
+    }
+
+    #[test]
+    fn existing_fisher_and_tide_use_the_configuration_wizard_without_reinstalling() {
+        let temp = TempDir::new().unwrap();
+        let environment = environment(temp.path());
+        let state = InstalledShellState {
+            fish_installed: true,
+            font_installed: true,
+            iterm_installed: true,
+            fish_registered: true,
+            fish_is_default: true,
+            fisher_installed: true,
+            fisher_incomplete: false,
+            tide_installed: true,
+            tide_incomplete: false,
+            fish_config_current: true,
+            iterm_profile_current: true,
+        };
+
+        let plan = build_setup_plan(
+            &environment,
+            &state,
+            &ShellSetupOptions {
+                dry_run: false,
+                change_default_shell: true,
+                configure_iterm: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.actions,
+            vec![SetupAction::ConfigureTide {
+                fish_path: "/opt/custom/bin/fish".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_tide_is_installed_without_opening_the_wizard() {
+        let temp = TempDir::new().unwrap();
+        let environment = environment(temp.path());
+        let state = InstalledShellState {
+            fish_installed: true,
+            font_installed: true,
+            iterm_installed: true,
+            fish_registered: true,
+            fish_is_default: true,
+            fisher_installed: true,
+            fish_config_current: true,
+            iterm_profile_current: true,
+            ..InstalledShellState::default()
+        };
+
+        let plan = build_setup_plan(
+            &environment,
+            &state,
+            &ShellSetupOptions {
+                dry_run: false,
+                change_default_shell: true,
+                configure_iterm: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.actions,
+            vec![SetupAction::InstallFishPlugin {
+                fish_path: "/opt/custom/bin/fish".into(),
+                plugin: TIDE_PLUGIN,
+            }]
+        );
+    }
+
+    #[test]
+    fn existing_plugin_files_are_detected_without_starting_fish() {
+        let temp = TempDir::new().unwrap();
+        let config = temp.path().join(".config/fish");
+        for path in [
+            "functions/fisher.fish",
+            "completions/fisher.fish",
+            "functions/tide.fish",
+            "functions/fish_prompt.fish",
+            "conf.d/_tide_init.fish",
+        ] {
+            let path = config.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "# existing\n").unwrap();
+        }
+
+        assert_eq!(fisher_state(temp.path()), (true, false));
+        assert_eq!(tide_state(temp.path()), (true, false));
+    }
+
+    #[test]
+    fn dry_run_does_not_launch_the_tide_wizard() {
+        let runner = FakeRunner::new();
+        let plan = SetupPlan {
+            actions: vec![SetupAction::ConfigureTide {
+                fish_path: "/opt/custom/bin/fish".into(),
+            }],
+        };
+
+        let output = SetupExecutor {
+            mode: ExecutionMode::DryRun,
+            runner: &runner,
+        }
+        .execute(&plan)
+        .unwrap();
+
+        assert_eq!(output, ["→ Open the Tide configuration wizard"]);
+        assert!(runner.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn tide_wizard_runs_interactively() {
+        let runner = FakeRunner::new();
+        let plan = SetupPlan {
+            actions: vec![SetupAction::ConfigureTide {
+                fish_path: "/opt/custom/bin/fish".into(),
+            }],
+        };
+
+        SetupExecutor {
+            mode: ExecutionMode::Apply,
+            runner: &runner,
+        }
+        .execute(&plan)
+        .unwrap();
+
+        assert_eq!(
+            runner.calls.borrow().as_slice(),
+            &[(
+                PathBuf::from("/opt/custom/bin/fish"),
+                vec!["-c".into(), "tide configure".into()],
+            )]
+        );
+    }
+
+    #[test]
+    fn fisher_installs_tide_in_the_configured_fish_shell() {
+        let runner = FakeRunner::new();
+        SetupExecutor {
+            mode: ExecutionMode::Apply,
+            runner: &runner,
+        }
+        .execute(&SetupPlan {
+            actions: vec![SetupAction::InstallFishPlugin {
+                fish_path: "/opt/custom/bin/fish".into(),
+                plugin: TIDE_PLUGIN,
+            }],
+        })
+        .unwrap();
+
+        assert_eq!(
+            runner.calls.borrow().as_slice(),
+            &[(
+                PathBuf::from("/opt/custom/bin/fish"),
+                vec!["-c".into(), format!("fisher install {TIDE_PLUGIN}")],
+            )]
+        );
+    }
+
+    #[test]
+    fn failed_tide_wizard_names_the_component_without_changing_files() {
+        struct FailingRunner;
+        impl ProcessRunner for FailingRunner {
+            fn run(&self, _: &Path, _: &[&str], _: Option<&str>) -> Result<ProcessOutput> {
+                unreachable!("the Tide wizard must use the interactive runner")
+            }
+
+            fn run_interactive(&self, _: &Path, _: &[&str]) -> Result<ProcessOutput> {
+                Ok(ProcessOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "terminal unavailable".into(),
+                })
+            }
+        }
+
+        let error = SetupExecutor {
+            mode: ExecutionMode::Apply,
+            runner: &FailingRunner,
+        }
+        .execute(&SetupPlan {
+            actions: vec![SetupAction::ConfigureTide {
+                fish_path: "/opt/custom/bin/fish".into(),
+            }],
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Could not configure Tide"));
     }
 
     #[test]
