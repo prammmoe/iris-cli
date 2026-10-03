@@ -462,6 +462,12 @@ impl GitReader for ProcessGit {
                 args
             }
             GitOperation::Push => vec!["push".into()],
+            GitOperation::PushUpstreamMain => vec![
+                "push".into(),
+                "--set-upstream".into(),
+                "origin".into(),
+                "main".into(),
+            ],
             GitOperation::Branch { all: false } => vec!["branch".into()],
             GitOperation::Branch { all: true } => vec!["branch".into(), "--all".into()],
             GitOperation::Stash => vec!["stash".into()],

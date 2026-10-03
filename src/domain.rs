@@ -42,6 +42,7 @@ pub enum GitOperation {
     AddAll,
     Add { paths: Vec<String> },
     Push,
+    PushUpstreamMain,
     Branch { all: bool },
     Stash,
     Log,

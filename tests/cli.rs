@@ -281,6 +281,119 @@ fn push_without_an_upstream_keeps_git_error_output() {
 }
 
 #[test]
+fn dispatch_upstream_pushes_main_and_sets_its_tracking_branch() {
+    let data_dir = TempDir::new().unwrap();
+    let repository = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    git(&["init"], repository.path());
+    git(&["branch", "-M", "main"], repository.path());
+    git(&["init", "--bare"], remote.path());
+    ProcessCommand::new("git")
+        .args(["config", "user.email", "iris@example.com"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    ProcessCommand::new("git")
+        .args(["config", "user.name", "Iris Test"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("README.md"), "upstream test\n").unwrap();
+    git(&["add", "README.md"], repository.path());
+    git(&["commit", "-m", "initial"], repository.path());
+    git(
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        repository.path(),
+    );
+
+    iris(&data_dir)
+        .current_dir(repository.path())
+        .args(["dispatch", "upstream"])
+        .assert()
+        .success();
+
+    let upstream = ProcessCommand::new("git")
+        .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .current_dir(repository.path())
+        .output()
+        .unwrap();
+    assert!(upstream.status.success());
+    assert_eq!(
+        String::from_utf8(upstream.stdout).unwrap().trim(),
+        "origin/main"
+    );
+    assert!(
+        ProcessCommand::new("git")
+            .args([
+                "--git-dir",
+                remote.path().to_str().unwrap(),
+                "show-ref",
+                "--verify",
+                "refs/heads/main",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn help_describes_commands_and_the_dispatch_upstream_shortcut() {
+    let data_dir = TempDir::new().unwrap();
+
+    iris(&data_dir)
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Manage local todos"))
+        .stdout(predicate::str::contains(
+            "Push commits from the current repository",
+        ));
+    iris(&data_dir)
+        .args(["dispatch", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("upstream"))
+        .stdout(predicate::str::contains("origin/main"));
+}
+
+#[test]
+fn shell_setup_accepts_its_required_flags() {
+    let data_dir = TempDir::new().unwrap();
+
+    for arguments in [
+        vec!["shell", "setup", "--dry-run"],
+        vec!["shell", "setup", "--dry-run", "--no-default-shell"],
+        vec!["shell", "setup", "--dry-run", "--skip-iterm"],
+    ] {
+        iris(&data_dir)
+            .args(arguments)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Dry run: no changes made."));
+    }
+}
+
+#[test]
+fn shell_status_and_doctor_are_available_without_setup() {
+    let data_dir = TempDir::new().unwrap();
+
+    iris(&data_dir)
+        .args(["shell", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Iris Shell"));
+    iris(&data_dir)
+        .args(["shell", "doctor"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Suggested fixes:")
+                .or(predicate::str::contains("No issues found.")),
+        );
+}
+
+#[test]
 fn git_shortcuts_use_the_current_repository() {
     let data_dir = TempDir::new().unwrap();
     let repository = TempDir::new().unwrap();
