@@ -81,7 +81,7 @@ pub fn compose_commit(
     };
     let diff = git.staged_diff(&repository)?;
     if diff.trim().is_empty() {
-        bail!("there are no staged changes");
+        bail!("there are no staged changes to be commited");
     }
     let message = composer.compose(&diff)?;
     validate_commit_message(&message)?;
